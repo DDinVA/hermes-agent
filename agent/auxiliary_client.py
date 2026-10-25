@@ -33,6 +33,7 @@ from agent.error_classifier import (
     is_reasoning_field_rejection,
     is_reasoning_required_rejection,
 )
+from agent.auxiliary_copilot_auth import _is_copilot_revoked_jwt, _refresh_copilot_credentials
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_structured_output import _route_key, _without_structured_output_format, remember_structured_output_rejection
@@ -3817,16 +3818,6 @@ async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mod
 
 def _creds_have_api_key(creds: dict[str, Any]) -> bool:
     return bool(str(creds.get("api_key", "") or "").strip())
-
-
-def _refresh_copilot_credentials() -> bool:
-    from hermes_cli.copilot_auth import _jwt_cache, _token_fingerprint, exchange_copilot_token, resolve_copilot_token
-    raw_token, _source = resolve_copilot_token()
-    if not str(raw_token or "").strip():
-        return False
-    _jwt_cache.pop(_token_fingerprint(raw_token), None)
-    exchange_copilot_token(raw_token)
-    return True
 
 
 def _refresh_codex_credentials() -> bool:
@@ -7747,8 +7738,8 @@ def _ladder_credential_rungs(
     client, task, tag, resolved_provider = route.client, route.task, route.tag, route.resolved_provider
     auth_refresh_provider = _auth_refresh_provider_for_route(
         resolved_provider, route.base_info, _effective_provider_for_client(client, ""))
-    if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
-            and not client_is_nous):
+    if ((_is_auth_error(first_err) or _is_copilot_revoked_jwt(first_err, auth_refresh_provider))
+            and auth_refresh_provider not in {"auto", "", None} and not client_is_nous):
         refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
                           if auth_refresh_provider == "anthropic" else {})
         if _refresh_provider_credentials(auth_refresh_provider, **refresh_kwargs):
@@ -7762,7 +7753,8 @@ def _ladder_credential_rungs(
                 "retry_same_provider",
                 (auth_refresh_provider, route.resolved_model or route.final_model))
             resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
+                step, lambda exc: (_credential_rung_accepts(exc) or _is_connection_error(exc)
+                                   or _is_copilot_revoked_jwt(exc, auth_refresh_provider)))
             if first_err is None:
                 return resp, None
             # ``first_err`` is now the retry's own failure, not the original auth error: the

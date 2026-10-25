@@ -398,6 +398,17 @@ def _print_anthropic_401_diagnostics(agent: Any, key: Any) -> None:
     )
 
 
+def _refresh_copilot_once(agent: Any, _retry: TurnRetryState, status_code: Optional[int]) -> bool:
+    """One-shot Copilot re-exchange (evicts the cached JWT in memory and on disk)."""
+    if _retry.copilot_auth_retry_attempted:
+        return False
+    _retry.copilot_auth_retry_attempted = True
+    if agent._try_refresh_copilot_client_credentials():
+        agent._buffer_vprint(f"🔐 Copilot credentials refreshed after {status_code}. Retrying request...")
+        return True
+    return False
+
+
 def _refresh_credentials_after_401(
     agent: Any, api_error: Exception, _retry: TurnRetryState, status_code: Optional[int]
 ) -> bool:
@@ -406,6 +417,11 @@ def _refresh_credentials_after_401(
     Returns True when a refresh succeeded and the call should be retried."""
     from agent.conversation_loop import _is_copilot_provider
 
+    # Copilot answers a server-revoked exchanged JWT with a bare 403 "forbidden" (#135645,
+    # #108022), not a 401. The JWT stays cached until its stored expires_at (hours), so without
+    # a re-exchange here every turn falls back. Same one-shot guard as the 401 path.
+    if status_code == 403 and _is_copilot_provider(agent):
+        return _refresh_copilot_once(agent, _retry, status_code)
     if status_code != 401:
         return False
     if (
@@ -433,11 +449,8 @@ def _refresh_credentials_after_401(
             agent._buffer_vprint("🔐 Nous agent key refreshed after 401. Retrying request...")
             return True
         _print_nous_401_diagnostics(agent, api_error)
-    if _is_copilot_provider(agent) and not _retry.copilot_auth_retry_attempted:
-        _retry.copilot_auth_retry_attempted = True
-        if agent._try_refresh_copilot_client_credentials():
-            agent._buffer_vprint("🔐 Copilot credentials refreshed after 401. Retrying request...")
-            return True
+    if _is_copilot_provider(agent) and _refresh_copilot_once(agent, _retry, status_code):
+        return True
     if (
         agent.api_mode == "anthropic_messages"
         and hasattr(agent, '_anthropic_api_key')
